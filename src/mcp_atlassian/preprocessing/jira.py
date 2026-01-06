@@ -9,6 +9,413 @@ from .base import BasePreprocessor
 logger = logging.getLogger("mcp-atlassian")
 
 
+def markdown_to_adf(
+    markdown_text: str,
+    attachments: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """
+    Convert Markdown text to Atlassian Document Format (ADF).
+
+    Supports:
+    - Headings (# ## ###)
+    - Bold (**text**) and Italic (*text*)
+    - Links [text](url) - Atlassian URLs become inlineCard smart links
+    - Bullet lists (- item)
+    - Numbered lists (1. item)
+    - Tables (| col | col | with |---| separator)
+    - Code blocks (```lang ... ```)
+    - Inline code (`code`)
+    - Horizontal rules (---)
+    - Panels via special syntax: {note}content{note} or {panel:note}content{panel}
+    - Expand/collapse sections: {expand:title}content{expand}
+    - Images (!filename! or ![alt](url)) - converted to ADF media nodes if attachments provided
+
+    Args:
+        markdown_text: Text in Markdown format
+        attachments: Optional dict mapping filenames to attachment IDs for image resolution
+
+    Returns:
+        ADF document as a dictionary
+    """
+    if not markdown_text:
+        return {"version": 1, "type": "doc", "content": []}
+
+    content = []
+    lines = markdown_text.split('\n')
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # Skip empty lines
+        if not line.strip():
+            i += 1
+            continue
+
+        # Check for expand start: {expand:title} or {expand}
+        expand_match = re.match(r'^\{expand(?::([^}]*))?\}$', line.strip())
+        if expand_match:
+            expand_title = expand_match.group(1) or ""
+            expand_content = []
+            i += 1
+            # Collect content until expand end
+            while i < len(lines):
+                if re.match(r'^\{expand\}$', lines[i].strip()):
+                    i += 1
+                    break
+                expand_content.append(lines[i])
+                i += 1
+            # Parse expand content recursively
+            expand_adf = markdown_to_adf('\n'.join(expand_content), attachments)
+            content.append({
+                "type": "expand",
+                "attrs": {"title": expand_title},
+                "content": expand_adf.get("content", [])
+            })
+            continue
+
+        # Check for panel start: {panel:type} or {info}, {note}, {warning}, etc.
+        panel_match = re.match(r'^\{(panel:)?(info|note|warning|success|error)\}$', line.strip())
+        if panel_match:
+            panel_type = panel_match.group(2)
+            panel_content = []
+            i += 1
+            # Collect content until panel end
+            while i < len(lines):
+                if re.match(r'^\{(panel|info|note|warning|success|error)\}$', lines[i].strip()):
+                    i += 1
+                    break
+                panel_content.append(lines[i])
+                i += 1
+            # Parse panel content recursively
+            panel_adf = markdown_to_adf('\n'.join(panel_content), attachments)
+            content.append({
+                "type": "panel",
+                "attrs": {"panelType": panel_type},
+                "content": panel_adf.get("content", [])
+            })
+            continue
+
+        # Check for code block start
+        code_match = re.match(r'^```(\w*)$', line)
+        if code_match:
+            language = code_match.group(1) or None
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # Skip closing ```
+
+            code_block = {"type": "codeBlock", "content": [{"type": "text", "text": '\n'.join(code_lines)}]}
+            if language:
+                code_block["attrs"] = {"language": language}
+            content.append(code_block)
+            continue
+
+        # Horizontal rule
+        if re.match(r'^-{3,}$', line.strip()) or re.match(r'^\*{3,}$', line.strip()) or re.match(r'^_{3,}$', line.strip()):
+            content.append({"type": "rule"})
+            i += 1
+            continue
+
+        # Headings
+        heading_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+        if heading_match:
+            level = len(heading_match.group(1))
+            heading_text = heading_match.group(2)
+            content.append({
+                "type": "heading",
+                "attrs": {"level": level},
+                "content": _parse_inline_content(heading_text, attachments)
+            })
+            i += 1
+            continue
+
+        # Bullet list
+        if re.match(r'^[-*+]\s+', line):
+            list_items = []
+            while i < len(lines) and re.match(r'^[-*+]\s+', lines[i]):
+                item_text = re.sub(r'^[-*+]\s+', '', lines[i])
+                # Handle checkbox syntax
+                checkbox_match = re.match(r'^\[([xX ])\]\s*(.*)$', item_text)
+                if checkbox_match:
+                    item_text = checkbox_match.group(2)
+                list_items.append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": _parse_inline_content(item_text, attachments)}]
+                })
+                i += 1
+            content.append({"type": "bulletList", "content": list_items})
+            continue
+
+        # Numbered list
+        if re.match(r'^\d+\.\s+', line):
+            list_items = []
+            while i < len(lines) and re.match(r'^\d+\.\s+', lines[i]):
+                item_text = re.sub(r'^\d+\.\s+', '', lines[i])
+                list_items.append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": _parse_inline_content(item_text, attachments)}]
+                })
+                i += 1
+            content.append({"type": "orderedList", "content": list_items})
+            continue
+
+        # Markdown table: detect header row followed by separator row
+        if re.match(r'^\|.+\|$', line.strip()):
+            # Check if next line is a separator (|---|---|)
+            if i + 1 < len(lines) and re.match(r'^\|[-:\s|]+\|$', lines[i + 1].strip()):
+                table_rows = []
+
+                # Parse header row
+                header_line = line.strip()
+                header_cells = [cell.strip() for cell in header_line.split('|')[1:-1]]
+                header_row = {
+                    "type": "tableRow",
+                    "content": [
+                        {
+                            "type": "tableHeader",
+                            "attrs": {},
+                            "content": [{"type": "paragraph", "content": _parse_inline_content(cell, attachments)}]
+                        }
+                        for cell in header_cells
+                    ]
+                }
+                table_rows.append(header_row)
+                i += 2  # Skip header and separator rows
+
+                # Parse data rows
+                while i < len(lines) and re.match(r'^\|.+\|$', lines[i].strip()):
+                    row_line = lines[i].strip()
+                    row_cells = [cell.strip() for cell in row_line.split('|')[1:-1]]
+                    data_row = {
+                        "type": "tableRow",
+                        "content": [
+                            {
+                                "type": "tableCell",
+                                "attrs": {},
+                                "content": [{"type": "paragraph", "content": _parse_inline_content(cell, attachments)}]
+                            }
+                            for cell in row_cells
+                        ]
+                    }
+                    table_rows.append(data_row)
+                    i += 1
+
+                content.append({
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": table_rows
+                })
+                continue
+
+        # Regular paragraph
+        para_lines = [line]
+        i += 1
+        # Collect continuation lines (non-empty, non-special)
+        while i < len(lines):
+            next_line = lines[i]
+            if not next_line.strip():
+                break
+            if re.match(r'^(#{1,6}|[-*+]|\d+\.)\s+', next_line):
+                break
+            if re.match(r'^-{3,}$|^\*{3,}$|^_{3,}$', next_line.strip()):
+                break
+            if re.match(r'^```', next_line):
+                break
+            if re.match(r'^\{(panel:)?(info|note|warning|success|error)\}$', next_line.strip()):
+                break
+            # Don't merge table rows into paragraphs
+            if re.match(r'^\|.+\|$', next_line.strip()):
+                break
+            para_lines.append(next_line)
+            i += 1
+
+        para_text = ' '.join(para_lines)
+        if para_text.strip():
+            content.append({
+                "type": "paragraph",
+                "content": _parse_inline_content(para_text, attachments)
+            })
+
+    return {"version": 1, "type": "doc", "content": content}
+
+
+def _parse_inline_content(
+    text: str,
+    attachments: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
+    """
+    Parse inline markdown elements (bold, italic, links, code, images).
+
+    Args:
+        text: Text with inline markdown formatting
+        attachments: Optional dict mapping filenames to attachment IDs for image resolution
+
+    Returns:
+        List of ADF inline nodes
+    """
+    if not text:
+        return []
+
+    result = []
+
+    # Pattern for inline elements: bold, italic, links, code, images
+    # Order matters - more specific patterns first
+    patterns = [
+        # Images: ![alt](url) or !filename!
+        (r'!\[([^\]]*)\]\(([^)]+)\)', 'image_md'),
+        (r'!([^!\s|]+)(?:\|[^!]*)?\!', 'image_jira'),
+        # Links: [text](url)
+        (r'\[([^\]]+)\]\(([^)]+)\)', 'link'),
+        # Bare Atlassian URLs (Jira issues, Confluence pages) - convert to inlineCard
+        (r'(https://[^\s]*\.atlassian\.net/(?:browse/[A-Z]+-\d+|wiki/[^\s]*))', 'bare_atlassian_url'),
+        # Bold + Italic: ***text*** or ___text___
+        (r'\*\*\*([^*]+)\*\*\*', 'bold_italic'),
+        (r'___([^_]+)___', 'bold_italic'),
+        # Bold: **text** or __text__
+        (r'\*\*([^*]+)\*\*', 'bold'),
+        (r'__([^_]+)__', 'bold'),
+        # Italic: *text* or _text_
+        (r'(?<!\*)\*([^*]+)\*(?!\*)', 'italic'),
+        (r'(?<!_)_([^_]+)_(?!_)', 'italic'),
+        # Inline code: `code`
+        (r'`([^`]+)`', 'code'),
+    ]
+
+    # Find all matches with their positions
+    matches = []
+    for pattern, mark_type in patterns:
+        for match in re.finditer(pattern, text):
+            matches.append((match.start(), match.end(), match, mark_type))
+
+    # Sort by position
+    matches.sort(key=lambda x: x[0])
+
+    # Remove overlapping matches (keep first)
+    filtered_matches = []
+    last_end = 0
+    for start, end, match, mark_type in matches:
+        if start >= last_end:
+            filtered_matches.append((start, end, match, mark_type))
+            last_end = end
+
+    # Build result
+    pos = 0
+    for start, end, match, mark_type in filtered_matches:
+        # Add plain text before this match
+        if start > pos:
+            plain_text = text[pos:start]
+            if plain_text:
+                result.append({"type": "text", "text": plain_text})
+
+        if mark_type == 'link':
+            link_text = match.group(1)
+            link_url = match.group(2)
+            # Use inlineCard for Atlassian URLs (Jira issues, Confluence pages)
+            if re.search(r'atlassian\.net/(?:browse/|wiki/|jira/)', link_url):
+                result.append({
+                    "type": "inlineCard",
+                    "attrs": {"url": link_url}
+                })
+            else:
+                result.append({
+                    "type": "text",
+                    "text": link_text,
+                    "marks": [{"type": "link", "attrs": {"href": link_url}}]
+                })
+        elif mark_type == 'bold':
+            result.append({
+                "type": "text",
+                "text": match.group(1),
+                "marks": [{"type": "strong"}]
+            })
+        elif mark_type == 'italic':
+            result.append({
+                "type": "text",
+                "text": match.group(1),
+                "marks": [{"type": "em"}]
+            })
+        elif mark_type == 'bold_italic':
+            result.append({
+                "type": "text",
+                "text": match.group(1),
+                "marks": [{"type": "strong"}, {"type": "em"}]
+            })
+        elif mark_type == 'code':
+            result.append({
+                "type": "text",
+                "text": match.group(1),
+                "marks": [{"type": "code"}]
+            })
+        elif mark_type == 'bare_atlassian_url':
+            result.append({
+                "type": "inlineCard",
+                "attrs": {"url": match.group(1)}
+            })
+        elif mark_type in ('image_md', 'image_jira'):
+            # Handle images - use proper ADF media nodes if we have attachment info
+            filename = None
+            if mark_type == 'image_jira':
+                # Jira syntax: !filename! or !filename|width=X!
+                filename = match.group(1)
+            else:
+                # Markdown syntax: ![alt](url)
+                url = match.group(2)
+                if not url.startswith('http'):
+                    filename = url
+
+            # Try to resolve to proper ADF media node if we have attachment mapping
+            if filename and attachments and filename in attachments:
+                attachment_id = attachments[filename]
+                # Use mediaInline for inline images in ADF
+                result.append({
+                    "type": "mediaInline",
+                    "attrs": {
+                        "id": attachment_id,
+                        "type": "file",
+                        "collection": ""
+                    }
+                })
+            elif mark_type == 'image_md' and match.group(2).startswith('http'):
+                # External URL image - convert to link
+                alt_text = match.group(1)
+                url = match.group(2)
+                result.append({
+                    "type": "text",
+                    "text": alt_text or url,
+                    "marks": [{"type": "link", "attrs": {"href": url}}]
+                })
+            else:
+                # No attachment mapping available - preserve as placeholder text
+                # This will show as text but won't break the update
+                if filename:
+                    result.append({
+                        "type": "text",
+                        "text": f"[Image: {filename}]"
+                    })
+                else:
+                    result.append({
+                        "type": "text",
+                        "text": match.group(0)
+                    })
+
+        pos = end
+
+    # Add remaining text
+    if pos < len(text):
+        remaining = text[pos:]
+        if remaining:
+            result.append({"type": "text", "text": remaining})
+
+    # If no matches, return plain text
+    if not result and text:
+        result.append({"type": "text", "text": text})
+
+    return result
+
+
 class JiraPreprocessor(BasePreprocessor):
     """Handles text preprocessing for Jira content."""
 

@@ -1,6 +1,7 @@
 """Module for Jira issue operations."""
 
 import logging
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -9,6 +10,7 @@ from requests.exceptions import HTTPError
 from ..exceptions import MCPAtlassianAuthenticationError
 from ..models.jira import JiraIssue
 from ..models.jira.common import JiraChangelog
+from ..preprocessing.jira import markdown_to_adf
 from ..utils import parse_date
 from .client import JiraClient
 from .constants import DEFAULT_READ_JIRA_FIELDS
@@ -1011,12 +1013,41 @@ class IssuesMixin(
 
             update_fields = fields or {}
             attachments_result = None
+            use_adf = False  # Flag to track if we should use ADF format
+            original_description = None  # Save original for fallback
+            attachment_mapping: dict[str, str] = {}  # filename -> attachment_id
 
-            # Convert description from Markdown to Jira format if present
+            # Convert description from Markdown to appropriate format
             if "description" in update_fields:
-                update_fields["description"] = self._markdown_to_jira(
-                    update_fields["description"]
-                )
+                original_description = update_fields["description"]  # Save before converting
+
+                # Check if description contains image references (!filename!)
+                # If so, fetch current attachments to build filename->ID mapping for ADF
+                if self.config.is_cloud and re.search(r'!([^!\s|]+)(?:\|[^!]*)?\!', original_description or ''):
+                    try:
+                        issue_data = self.jira.get_issue(issue_key, fields="attachment")
+                        if isinstance(issue_data, dict):
+                            raw_attachments = issue_data.get("fields", {}).get("attachment", [])
+                            for att in raw_attachments:
+                                if isinstance(att, dict) and "filename" in att and "id" in att:
+                                    attachment_mapping[att["filename"]] = att["id"]
+                            if attachment_mapping:
+                                logger.info(f"Found {len(attachment_mapping)} attachments for image resolution: {list(attachment_mapping.keys())}")
+                    except Exception as e:
+                        logger.warning(f"Could not fetch attachments for image resolution: {e}")
+
+                if self.config.is_cloud:
+                    # For Jira Cloud, use native ADF format for better formatting support
+                    update_fields["description"] = markdown_to_adf(
+                        update_fields["description"],
+                        attachments=attachment_mapping if attachment_mapping else None
+                    )
+                    use_adf = True
+                else:
+                    # For Server/DC, use wiki markup
+                    update_fields["description"] = self._markdown_to_jira(
+                        update_fields["description"]
+                    )
 
             # Process kwargs
             for key, value in kwargs.items():
@@ -1045,8 +1076,29 @@ class IssuesMixin(
                         except ValueError as e:
                             logger.warning(f"Could not update assignee: {str(e)}")
                 elif key == "description":
-                    # Handle description with markdown conversion
-                    update_fields["description"] = self._markdown_to_jira(value)
+                    # Handle description with appropriate format conversion
+                    original_description = value  # Save for fallback
+
+                    # Check if description contains image references and fetch attachments if needed
+                    if self.config.is_cloud and not attachment_mapping and re.search(r'!([^!\s|]+)(?:\|[^!]*)?\!', value or ''):
+                        try:
+                            issue_data = self.jira.get_issue(issue_key, fields="attachment")
+                            if isinstance(issue_data, dict):
+                                raw_attachments = issue_data.get("fields", {}).get("attachment", [])
+                                for att in raw_attachments:
+                                    if isinstance(att, dict) and "filename" in att and "id" in att:
+                                        attachment_mapping[att["filename"]] = att["id"]
+                        except Exception as e:
+                            logger.warning(f"Could not fetch attachments for image resolution: {e}")
+
+                    if self.config.is_cloud:
+                        update_fields["description"] = markdown_to_adf(
+                            value,
+                            attachments=attachment_mapping if attachment_mapping else None
+                        )
+                        use_adf = True
+                    else:
+                        update_fields["description"] = self._markdown_to_jira(value)
                 else:
                     # Process regular fields using _process_additional_fields
                     # Create a temporary dict with just this field
@@ -1055,9 +1107,37 @@ class IssuesMixin(
 
             # Update the issue fields
             if update_fields:
-                self.jira.update_issue(
-                    issue_key=issue_key, update={"fields": update_fields}
-                )
+                if use_adf and self.config.is_cloud:
+                    # Use v3 API for ADF format (Jira Cloud only)
+                    try:
+                        import json as json_module
+                        logger.info(f"Attempting v3 API update for {issue_key}")
+                        logger.debug(f"ADF payload: {json_module.dumps(update_fields.get('description', {}), indent=2)[:500]}")
+                        self.jira.put(
+                            f"rest/api/3/issue/{issue_key}",
+                            data={"fields": update_fields}
+                        )
+                        logger.info(f"v3 API update succeeded for {issue_key}")
+                    except Exception as api_err:
+                        logger.warning(
+                            f"v3 API update failed, falling back to v2: {api_err}"
+                        )
+                        # Log the full error details
+                        if hasattr(api_err, 'response') and api_err.response is not None:
+                            logger.warning(f"Response status: {api_err.response.status_code}")
+                            logger.warning(f"Response body: {api_err.response.text[:500]}")
+                        # Fallback: convert original markdown to wiki markup
+                        if "description" in update_fields and original_description:
+                            update_fields["description"] = self._markdown_to_jira(
+                                original_description
+                            )
+                        self.jira.update_issue(
+                            issue_key=issue_key, update={"fields": update_fields}
+                        )
+                else:
+                    self.jira.update_issue(
+                        issue_key=issue_key, update={"fields": update_fields}
+                    )
 
             # Handle attachments if provided
             if "attachments" in kwargs and kwargs["attachments"]:
